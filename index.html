@@ -1,49 +1,94 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>MyTechStudy • PDF Viewer</title>
-  <style>
-    :root { --bg:#0b0f18; --ink:#e9eef6; --muted:#9ab; }
-    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink);
-                 font: 500 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial; }
-    header {
-      position: sticky; top: 0; z-index: 2;
-      padding: 10px 14px; background: linear-gradient(to bottom, rgba(0,0,0,.55), rgba(0,0,0,0));
-      display: flex; gap: 10px; align-items: center;
-    }
-    header h1 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing:.2px; }
-    header .muted { color: var(--muted); font-size: 14px }
-    .wrap { height: calc(100% - 48px); } /* header ≈48px */
-    iframe {
-      width: 100%; height: 100%; border: 0; display: block; background: #0b0f18;
-    }
-    a.button {
-      margin-left: auto; text-decoration: none; color: white; background: rgba(255,255,255,.1);
-      border: 1px solid rgba(255,255,255,.18); padding: 6px 10px; border-radius: 10px;
-      backdrop-filter: blur(6px);
-    }
-  </style>
-</head>
-<body>
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>PDF Viewer</title>
+<style>
+  :root{--ui:rgba(0,0,0,.55);--ink:#fff}
+  html,body{height:100%;margin:0;background:#0b0f18;color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  #top{position:fixed;inset:0 0 auto 0;display:flex;gap:8px;align-items:center;padding:8px 12px;background:linear-gradient(to bottom,rgba(0,0,0,.55),rgba(0,0,0,0));z-index:5}
+  .btn{border:1px solid rgba(255,255,255,.2);background:var(--ui);color:#fff;padding:8px 12px;border-radius:10px;font-weight:600;cursor:pointer;backdrop-filter:blur(6px)}
+  .grow{flex:1}
+  #viewer{position:fixed;inset:0;padding:60px 0 0;overflow:auto;display:flex;flex-direction:column;align-items:center;gap:12px}
+  .page{width:min(100%,1000px);background:#111827;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.07);display:grid;place-items:center;min-height:220px}
+  .ph{color:#9ab;font-size:12px;padding:18px}
+  canvas{display:block;width:100%;height:auto}
+</style>
+</head><body>
+<div id="top">
+  <button id="zOut" class="btn">−</button>
+  <button id="zIn"  class="btn">+</button>
+  <div class="grow"></div>
+  <span class="btn" style="pointer-events:none">Page <b id="cur">1</b> / <b id="tot">…</b> • <span id="sc">100%</span></span>
+  <a id="dl" class="btn" download>Download</a>
+</div>
+<div id="viewer"></div>
 
-  <header>
-    <h1>MyTechStudy • PDF Viewer</h1>
-    <span class="muted">Fast, lazy-loaded rendering</span>
-    <!-- Optional: Open in a new tab -->
-    <a class="button" href="viewer.html?file=https%3A%2F%2Ffiles.mytechstudy.in%2FPDN_HANDBOOK_VOLLUME_I.pdf" target="_blank" rel="noopener">Open in new tab</a>
-  </header>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+(async () => {
+  const q = new URL(location.href).searchParams;
+  const PDF_URL = q.get('file') || 'https://files.mytechstudy.in/PDN_HANDBOOK_VOLLUME_I.pdf';
+  const params = { url: PDF_URL, rangeChunkSize: 65536, disableStream: false, disableAutoFetch: false };
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
 
-  <div class="wrap">
-    <!-- Embed the viewer page and pass your PDF URL (URL-encoded) -->
-    <iframe
-      src="viewer.html?file=https%3A%2F%2Ffiles.mytechstudy.in%2FPDN_HANDBOOK_VOLLUME_I.pdf"
-      loading="lazy"
-      referrerpolicy="no-referrer"
-      title="PDF Viewer"
-    ></iframe>
-  </div>
+  const viewer=document.getElementById('viewer'), zIn=document.getElementById('zIn'),
+        zOut=document.getElementById('zOut'), cur=document.getElementById('cur'),
+        tot=document.getElementById('tot'), sc=document.getElementById('sc'), dl=document.getElementById('dl');
 
-</body>
-</html>
+  dl.href = PDF_URL;
+
+  let pdf, scale=1, DPR=Math.min(2, window.devicePixelRatio||1), pages=[], rendering=new Set();
+  try {
+    pdf = await pdfjsLib.getDocument(params).promise;
+  } catch(e){ viewer.innerHTML = '<div style="padding:24px;color:#faa">Failed to load PDF.</div>'; return; }
+  tot.textContent = pdf.numPages;
+
+  for (let i=1;i<=pdf.numPages;i++){
+    const div=document.createElement('div'); div.className='page'; div.id='p'+i;
+    const ph=document.createElement('div'); ph.className='ph'; ph.textContent=`Page ${i}`;
+    div.appendChild(ph); viewer.appendChild(div);
+    pages.push({el:div, num:i, rendered:false, canvas:null});
+  }
+
+  const p1 = await pdf.getPage(1);
+  const fit = (pages[0].el.clientWidth||800) / p1.getViewport({scale:1}).width;
+  scale = fit; sc.textContent = Math.round(scale*100)+'%';
+
+  const io=new IntersectionObserver(es=>{
+    es.forEach(e=>{ if(e.isIntersecting){ const i=parseInt(e.target.id.slice(1),10)-1; render(i); }});
+  },{root:viewer, rootMargin:'600px 0px', threshold:.01});
+  pages.forEach(p=>io.observe(p.el));
+  render(0);
+
+  async function render(i){
+    const p=pages[i]; if(!pdf||p.rendered||rendering.has(i)) return; rendering.add(i);
+    try{
+      const page=await pdf.getPage(p.num), vp=page.getViewport({scale});
+      const c=document.createElement('canvas'), ctx=c.getContext('2d');
+      c.width=Math.floor(vp.width*DPR); c.height=Math.floor(vp.height*DPR);
+      c.style.width=Math.floor(vp.width)+'px'; c.style.height=Math.floor(vp.height)+'px';
+      await page.render({canvasContext:ctx, viewport:vp, transform:[DPR,0,0,DPR,0,0]}).promise;
+      p.el.innerHTML=''; p.el.appendChild(c); p.canvas=c; p.rendered=true;
+    } finally { rendering.delete(i); }
+  }
+
+  function rerenderAll(){
+    pages.forEach(p=>{ if(p.rendered){ p.rendered=false; p.el.innerHTML='<div class="ph">Page '+p.num+'</div>'; p.canvas=null; }});
+    const i=currentIndex(); for(let j=Math.max(0,i-2); j<=Math.min(pages.length-1,i+4); j++) render(j);
+    sc.textContent = Math.round(scale*100)+'%';
+  }
+  function currentIndex(){
+    const y=viewer.scrollTop+70, mid=viewer.scrollTop+viewer.clientHeight/2;
+    let best=0,bestD=1e9;
+    for(let i=0;i<pages.length;i++){ const r=pages[i].el; const d=Math.abs((r.offsetTop+r.offsetHeight/2)-mid); if(d<bestD){bestD=d;best=i;} }
+    cur.textContent = best+1; return best;
+  }
+  viewer.addEventListener('scroll', currentIndex, {passive:true});
+  zIn.onclick = ()=>{ scale=Math.min(scale*1.2,5); rerenderAll(); };
+  zOut.onclick= ()=>{ scale=Math.max(scale/1.2,.25); rerenderAll(); };
+  let rt=null; addEventListener('resize',()=>{ clearTimeout(rt); rt=setTimeout(async ()=>{
+    const fit=(pages[0].el.clientWidth||800)/(await pdf.getPage(1)).getViewport({scale:1}).width;
+    const factor=scale/fit; scale=fit*factor; rerenderAll();
+  },150)},{passive:true});
+})();
+</script>
+</body></html>
