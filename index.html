@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Fast PDF Viewer</title>
+<style>
+  :root { --ui: rgba(0,0,0,.55); --ink:#fff; }
+  html,body{height:100%; margin:0; background:#0b0f18; color:var(--ink); font-family:system-ui,-apple-system,Segoe UI,Roboto}
+  #topbar{
+    position:fixed; inset:0 0 auto 0; display:flex; gap:8px; align-items:center; padding:8px 12px;
+    background:linear-gradient(to bottom, rgba(0,0,0,.55), rgba(0,0,0,.0));
+    z-index:5; user-select:none
+  }
+  .btn{appearance:none; border:1px solid rgba(255,255,255,.2); background:var(--ui);
+       color:#fff; padding:8px 12px; border-radius:10px; font-weight:600; cursor:pointer; backdrop-filter:blur(6px)}
+  .btn:disabled{opacity:.5; cursor:not-allowed}
+  .grow{flex:1}
+  #viewer{
+    position:fixed; inset:0; padding:60px 0 0; overflow:auto; -webkit-overflow-scrolling:touch;
+    display:flex; flex-direction:column; align-items:center; gap:12px;
+  }
+  .page{
+    position:relative; width:min(100%, 1000px); background:#111827; border-radius:12px; overflow:hidden;
+    box-shadow:0 6px 24px rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.07);
+    display:grid; place-items:center; min-height:200px;
+  }
+  .ph{color:#9ab; font-size:12px; padding:18px}
+  canvas{display:block; width:100%; height:auto}
+  #loadMore{display:none; margin:24px auto; color:#9ab}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <button id="zoomOut" class="btn" title="Zoom out">−</button>
+  <button id="zoomIn"  class="btn" title="Zoom in">+</button>
+  <div class="grow"></div>
+  <span id="info" class="btn" style="pointer-events:none">Page <b id="cur">1</b> / <b id="total">…</b> • <span id="scaleLbl">100%</span></span>
+  <a id="download" class="btn" download>Download</a>
+</div>
+
+<div id="viewer"></div>
+<div id="loadMore">Loading…</div>
+
+<!-- PDF.js (stable UMD build) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+(() => {
+  // ===== SET THIS to your file =====
+  const PDF_URL = 'https://pub-8356489ebab24327ba4461e540391cac.r2.dev/pdfs/PWD%20Handbook%20Ch%2032%20Construction%20Machinary%20(final)_compressed.pdf';
+
+  // Worker for performance
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+
+  const viewer   = document.getElementById('viewer');
+  const zoomIn   = document.getElementById('zoomIn');
+  const zoomOut  = document.getElementById('zoomOut');
+  const curEl    = document.getElementById('cur');
+  const totalEl  = document.getElementById('total');
+  const scaleLbl = document.getElementById('scaleLbl');
+  const dl       = document.getElementById('download');
+  const loadMore = document.getElementById('loadMore');
+
+  // State
+  let pdf = null;
+  let scale = 1.0;           // base zoom (1.0 = fits width for first render)
+  const DPR = Math.min(2, window.devicePixelRatio || 1.0); // cap DPR to keep memory sane
+  let rendering = new Set();
+  let pageEls = [];          // {container, canvas, num, rendered}
+
+  // Fast: allow streaming & range requests
+  const params = {
+    url: PDF_URL,
+    withCredentials: false,   // set true only if your R2 needs cookies (usually false)
+    rangeChunkSize: 65536,    // 64KB chunks for faster first paint
+    disableStream: false,
+    disableAutoFetch: false,
+  };
+
+  // Init
+  dl.href = PDF_URL;
+  dl.textContent = 'Download';
+  pdfjsLib.getDocument(params).promise.then(async (_pdf) => {
+    pdf = _pdf;
+    totalEl.textContent = pdf.numPages;
+
+    // Build placeholders quickly
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const div = document.createElement('div'); div.className = 'page'; div.id = 'p'+i;
+      const ph  = document.createElement('div'); ph.className='ph'; ph.textContent = `Page ${i}`;
+      div.appendChild(ph);
+      viewer.appendChild(div);
+      pageEls.push({ container: div, canvas: null, num: i, rendered: false, viewport: null });
+    }
+
+    // Fit the first page to container width to pick a nice base scale
+    const firstPage = await pdf.getPage(1);
+    const contW = pageEls[0].container.clientWidth || 800;
+    const vp = firstPage.getViewport({ scale: 1 });
+    scale = contW / vp.width;
+    scaleLbl.textContent = Math.round(scale * 100) + '%';
+
+    // Observer: render when page enters viewport (virtualized)
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        const idx = parseInt(e.target.id.slice(1), 10) - 1;
+        if (e.isIntersecting) renderPage(idx);
+      });
+    }, { root: viewer, rootMargin: '600px 0px', threshold: 0.01 });
+
+    pageEls.forEach(p => io.observe(p.container));
+    // Render the first page right away
+    renderPage(0);
+    viewer.addEventListener('scroll', updateCurrentPage);
+  }).catch(err => {
+    console.error(err);
+    viewer.innerHTML = `<div style="padding:24px;color:#faa">Failed to load PDF. Check CORS/public access and the URL.</div>`;
+  });
+
+  async function renderPage(idx) {
+    const p = pageEls[idx];
+    if (!pdf || p.rendered || rendering.has(idx)) return;
+    rendering.add(idx);
+    try {
+      const page = await pdf.getPage(p.num);
+      const vp   = page.getViewport({ scale: scale });
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+
+      // device-pixel aware canvas for sharpness
+      canvas.width  = Math.floor(vp.width  * DPR);
+      canvas.height = Math.floor(vp.height * DPR);
+      canvas.style.width  = Math.floor(vp.width) + 'px';
+      canvas.style.height = Math.floor(vp.height) + 'px';
+
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport: vp.clone({ dontFlip: true }),
+        transform: [DPR, 0, 0, DPR, 0, 0],
+        enableWebGL: true
+      });
+
+      // Replace placeholder
+      await renderTask.promise;
+      p.container.innerHTML = '';
+      p.container.appendChild(canvas);
+      p.canvas = canvas;
+      p.rendered = true;
+      p.viewport = vp;
+    } catch (e) {
+      console.error('render error p', idx+1, e);
+    } finally {
+      rendering.delete(idx);
+    }
+  }
+
+  function rerenderAll() {
+    // mark all rendered pages dirty; they’ll get re-rendered as they re-enter view
+    pageEls.forEach(p => { 
+      if (p.rendered) { 
+        p.rendered = false; 
+        if (p.canvas) p.container.removeChild(p.canvas);
+        const ph  = document.createElement('div'); ph.className='ph'; ph.textContent = `Page ${p.num}`;
+        p.container.appendChild(ph);
+        p.canvas = null; p.viewport = null;
+      }
+    });
+    // kick current + neighbors
+    const idx = currentIndex();
+    for (let j = Math.max(0, idx - 2); j <= Math.min(pageEls.length - 1, idx + 4); j++) renderPage(j);
+    scaleLbl.textContent = Math.round(scale * 100) + '%';
+  }
+
+  function currentIndex() {
+    // naive: compute nearest page to top
+    let top = viewer.scrollTop + 70; // account for toolbar
+    for (let i = 0; i < pageEls.length; i++) {
+      const r = pageEls[i].container.getBoundingClientRect();
+      const baseTop = pageEls[i].container.offsetTop;
+      if (baseTop > top) return Math.max(0, i - 1);
+    }
+    return pageEls.length - 1;
+  }
+
+  function updateCurrentPage() {
+    const pages = pageEls;
+    let best = 0, bestDist = Infinity;
+    const mid = viewer.scrollTop + viewer.clientHeight / 2;
+    for (let i = 0; i < pages.length; i++) {
+      const el = pages[i].container;
+      const center = el.offsetTop + el.offsetHeight / 2;
+      const d = Math.abs(center - mid);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    curEl.textContent = (best + 1);
+  }
+
+  // Zoom controls
+  zoomIn.onclick = () => { scale = Math.min(scale * 1.2, 5); rerenderAll(); };
+  zoomOut.onclick = () => { scale = Math.max(scale / 1.2, 0.25); rerenderAll(); };
+
+  // Resize: keep pages fitting width smoothly
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    if (!pdf) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(async () => {
+      // recompute base scale to fit current container width for page 1
+      const contW = pageEls[0].container.clientWidth || 800;
+      const p1 = await pdf.getPage(1);
+      const vp = p1.getViewport({ scale: 1 });
+      const fit = contW / vp.width;
+      // keep relative zoom (user factor) by mapping old → new
+      const factor = scale / fit;
+      scale = fit * factor;
+      rerenderAll();
+    }, 150);
+  }, { passive:true });
+})();
+</script>
+</body>
+</html>
